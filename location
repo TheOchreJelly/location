@@ -1,0 +1,279 @@
+#!/usr/bin/env python
+'Get the current location of your Mac by sending nearby WiFi access points to Google'
+
+# If you don't want your access point scanned by Google,
+# they suggest you append "_nomap" to your SSID!
+# See http://support.google.com/maps/bin/answer.py?hl=en&answer=1725632
+
+# TODO: Core Location version
+
+
+import os, sys, json, time, signal, argparse, urllib2, subprocess, plistlib
+
+
+__version__ = '1.00'
+__licence__ = 'public domain'
+_airport = '/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport'
+
+default_scan_period = 15  # seconds
+
+
+class LocationError(Exception):
+  'ambiguous exception'
+
+class WiFiError(LocationError):
+  'Wi-Fi error'
+
+class GoogleError(LocationError):
+  'error fetching from Google'
+
+class FileError(LocationError):
+  'file error'
+
+
+def _out(s, quiet=False):
+  if not quiet:
+    sys.stdout.write('\r\x1b[K\x1b[33m%s\x1b[0m' % s)  # yellow
+    sys.stdout.flush()
+
+
+def _fatal(s):
+  sys.stdout.write('\n\x1b[0m\x1b[31mError %s\x1b[0m\n' % s)  # red
+  sys.exit(1)
+
+
+def wifi_scan():
+  'scan the Wi-Fi network and return a list of access points'
+  # access_point: {
+  #   "mac_address"     : "c4-3d-c7-77-e-b3",
+  #   "channel"         : 10,
+  #   "signal_to_noise" : -87,
+  #   "signal_strength" : -87,
+  #   "ssid"            : "RISA"
+  # }
+  if not os.access(_airport, os.X_OK):
+    raise WiFiError('cannot run airport command: ' + _airport)
+  try:
+    data = subprocess.check_output([_airport, '-s', '-x'])
+  except:
+    raise WiFiError('cannot perform Wi-Fi scan')
+  if not data.strip():
+    sys.exit('\rNo Wi-Fi access points found. Is the Wi-Fi turned on?')
+  try:
+    plist = plistlib.readPlistFromString(data)
+  except:
+    raise WiFiError('invalid response from airport command')
+  access_points = []
+  for ap in plist:
+    access_points += [ {
+          'mac_address'     : ap.get('BSSID'),
+          'ssid'            : ap.get('SSID').data if ap.get('SSID') else None,
+          'channel'         : ap.get('CHANNEL'),
+          'signal_to_noise' : ap.get('NOISE'),
+          'signal_strength' : ap.get('RSSI')
+      } ]
+  return access_points
+
+
+def save_access_points(access_points, filename=None):
+  'save access points to a file in JSON format, default filename is a timestamp'
+  if not filename: 
+    filename = time.strftime('%Y-%m-%d_%H_%M_%S') + '.location'
+  if os.path.exists(filename):
+    raise FileError('file already exists: %s' % filename)
+  with open(filename, 'w') as f:
+    try:
+      f.write(json.dumps(access_points))
+    except:
+      raise FileError('cannot write file: %s' % filename)
+  return filename
+
+
+def _ctrl_c(signum, frame):
+  print
+  sys.exit(0)
+
+
+def _save_continuously(seconds=default_scan_period, quiet=False):
+  _out('Saving every %d seconds (Ctrl-C to quit)\n' % seconds, quiet)
+  signal.signal(signal.SIGINT, _ctrl_c)
+  count = 1
+  while True:
+    _out('%d: Scanning Wi-Fi... ' % count, quiet)
+    try:
+      access_points = wifi_scan()
+    except (WiFiError) as e:
+      _fatal(e)
+    try:
+      filename = save_access_points(access_points)
+    except (FileError) as e:
+      _fatal(e)
+    _out('%d: Saved %s... with %d access points. Sleeping %d seconds... ' % (count, filename, len(access_points), seconds), quiet)
+    time.sleep(seconds)
+    count +=1
+
+
+def load_access_points(filename):
+  'load access points from a JSON format file'
+  if not os.path.exists(filename):
+    raise FileError('file does not exist: %s' % filename)
+  with open(filename, 'r') as f:
+    try:
+      data = f.read()
+    except:
+      raise FileError('cannot read file: %s' % filename)
+  try:
+    access_points = json.loads(data)
+  except:
+    raise FileError('cannot load file: %s' % filename)
+  return access_points
+
+
+def get_location(access_points):
+  'get location from Google by supplying nearby access points'
+  # location: {
+  #   "location" : {
+  #     "latitude"  : -33.1234567,
+  #     "longitude" : 151.1234567,
+  #     "address" : {
+  #       "country"       : "Australia",
+  #       "country_code"  : "AU",
+  #       "region"        : "New South Wales",
+  #       "city"          : "Jelly Bay",
+  #       "street"        : "Jelly St",
+  #       "street_number" : "66",
+  #       "postal_code"   : "6666"
+  #     },
+  #     "accuracy" : 20.0
+  #   },
+  #   "access_token" : "2:5bqREeflSmJeICRI:BwNL2nsjFzg6iyl1"
+  # }
+  url = 'http://www.google.com/loc/json'
+  payload = {
+      'version': '1.1.0',
+      'host': 'http://localhost', 
+      'request_address': True,
+      'wifi_towers': access_points
+    }
+  post_data = json.dumps(payload)
+  req = urllib2.Request(url, data=post_data, headers={'Content-Type':'application/json'})
+  resp = urllib2.urlopen(req)
+  if resp.code != 200:
+    raise GoogleError('error fetching location from Google (return status %d)' % resp.code)
+  if resp.headers['content-type'] != 'application/json; charset=UTF-8':
+    raise GoogleError('error fetching location from Google (content-type = %s)' % resp.headers['content-type'])
+  data = resp.read()
+  try:
+    location = json.loads(data)
+  except:
+    raise GoogleError('invalid JSON from Google')    
+  return location.get('location')
+
+
+def print_location(access_points, filename=None, quiet=False):
+  'print a location'
+  # 66 Jelly St
+  # Jelly Bay NSW 6666
+  # Australia
+  # Lat/Long: -33.1234567, 151.1234567
+  # Accuracy: 20.0
+  # Using 14 Wi-Fi access points
+  _out('Fetching location from Google... ', quiet)
+  try:
+    location = get_location(access_points)
+  except (GoogleError) as e:
+    _fatal(e)
+  adr = location['address']
+  line = ' '.join([adr.get(i, '') for i in ['street_number', 'street']]).strip()
+  if line:
+    _out(line + '\n')
+  line = ', '.join([adr.get(i, '') for i in ['city', 'region', 'postal_code']]).strip()
+  if line:
+    _out(line + '\n')
+  if adr.get('country'):
+    _out(adr.get('country') + '\n')
+  _out('Lat, Lon: %s, %s' % (location['latitude'], location['longitude']) + '\n')
+  _out('Accuracy: %s' % location['accuracy'] + 'm\n')
+  line = 'Used %d Wi-Fi access points'  % len(access_points)
+  if filename:
+    line += ' from file: %s' % filename
+  _out(line + '\n')
+
+
+def _main():
+  parser = argparse.ArgumentParser(description=__doc__)
+  parser.add_argument(
+      '-j', '--json', action='store_true', default=argparse.SUPPRESS,
+      help='Output JSON')
+  parser.add_argument(
+      '-q', '--quiet', action='store_true',
+      help='Quiet')
+  file = parser.add_mutually_exclusive_group()
+  file.add_argument(
+      '-s', '--save', metavar='FILE', nargs='?', default=argparse.SUPPRESS,
+      help='save Wi-Fi scan in JSON format and exit (default FILE = TIMESTAMP.location)')
+  file.add_argument(
+      '-l', '--load', metavar='FILE', nargs='+',
+      help='loads saved Wi-Fi scans and get their locations')
+  file.add_argument(
+      '-c', '--continuous', metavar='SEC', nargs='?', type=int, default=argparse.SUPPRESS,
+      help='save every SEC seconds (default %d). Ctrl-C to end' % default_scan_period)
+  args = parser.parse_args()
+  if 'continuous' in args:
+    _save_continuously(args.continuous if args.continuous else default_scan_period, args.quiet)
+    sys.exit(0)
+  if args.load:
+    if 'json' in args:
+      a = []
+      for filename in args.load:
+        try:
+          access_points = load_access_points(filename)
+        except (FileError) as e:
+          _fatal(e)
+        try:
+          location = get_location(access_points)
+        except (GoogleError) as e:
+          _fatal(e)
+        addr = location['address']
+        addr['filename'] = filename
+        a.append(addr)
+      print json.dumps(a, indent=2)
+      sys.exit(0)
+    for filename in args.load:
+      _out('Loading access points from %s... ' % filename, args.quiet)
+      try:
+        access_points = load_access_points(filename)
+      except (FileError) as e:
+        _fatal(e)
+      _out('Fetching location for %s... ' % filename, args.quiet)
+      print_location(access_points, filename, args.quiet)
+      print
+    sys.exit(0)
+  else:
+    if 'json' not in args:
+      _out('Scanning Wi-Fi... ', args.quiet)
+    try:
+      access_points = wifi_scan()
+    except (WiFiError) as e:
+      _fatal(e)
+  if 'save' in args:
+    try:
+      filename = save_access_points(access_points, args.save)
+    except (FileError) as e:
+      _fatal(e)
+    _out('Saved: ' + filename + '\n', args.quiet)
+    sys.exit(0)
+  if 'json' in args:
+    try:
+      location = get_location(access_points)
+    except (GoogleError) as e:
+      _fatal(e)
+    addr = location['address']
+    print json.dumps(addr, indent=2)
+  else:
+    print_location(access_points, args.load, args.quiet)
+
+
+if __name__ == '__main__':
+  _main()
+
